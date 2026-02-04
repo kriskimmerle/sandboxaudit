@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "sandboxaudit"
+version = "1.0.0"
+description = "Python Sandbox Escape Pattern Detector — screen code before sandbox execution"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    {name = "Kris Kimmerle", email = "kris@kriskimmerle.com"},
+]
+keywords = ["sandbox", "security", "escape", "static-analysis", "audit"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/kriskimmerle/sandboxaudit"
+Repository = "https://github.com/kriskimmerle/sandboxaudit"
+
+[project.scripts]
+sandboxaudit = "sandboxaudit:main"

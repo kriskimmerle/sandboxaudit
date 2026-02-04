@@ -1,786 +1,1001 @@
 #!/usr/bin/env python3
-"""sandboxaudit - AI Agent Sandbox Security Auditor.
+"""sandboxaudit — Python Sandbox Escape Pattern Detector.
 
-Runtime probe that audits whether an AI coding agent's execution environment
-is properly isolated. Checks for exposed credentials, excessive permissions,
-missing sandboxing, network access, filesystem boundaries, and more.
+Scans Python code for patterns that attempt to escape restricted execution
+environments. Detects class hierarchy traversal, builtins access, format string
+introspection, import tricks, code object construction, frame introspection,
+and more.
 
-Run this inside your agent's sandbox to verify isolation before giving it
-autonomous code execution privileges (e.g., Ralph Wiggum loops, Claude Code
-with --dangerously-skip-permissions, Codex, etc.).
+Use this to pre-screen code before executing it in a sandbox.
 
-Maps to OWASP Top 10 for Agentic Applications 2026:
-  ASI03 - Identity and Privilege Abuse
-  ASI05 - Unexpected Code Execution
+Usage:
+    sandboxaudit submitted_code.py
+    sandboxaudit --check --threshold B code/
+    sandboxaudit --json code.py
+    cat code.py | sandboxaudit -
 
-Zero dependencies. Stdlib only. Python 3.8+.
+Informed by:
+    - n8n CVE-2026-0863 (format string + AttributeError.obj sandbox escape)
+    - n8n CVE-2025-68668 (Pyodide sandbox escape)
+    - RestrictedPython CVE-2025-22153 (try/except* escape)
+    - Langflow CVE-2025-3248 (decorator evaluation RCE)
+    - asteval GHSA-3wwr-3g9f-9gc7 (format string introspection)
+    - NVIDIA AI Red Team sandbox security guidance (Jan 2026)
 """
 
 from __future__ import annotations
 
-import argparse
+import ast
 import json
 import os
-import platform
 import re
-import socket
-import stat
-import subprocess
 import sys
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
-# ── Severity ────────────────────────────────────────────────────────
+# ── Check definitions ──────────────────────────────────────────────
 
-class Severity(Enum):
-    CRITICAL = "CRITICAL"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-    INFO = "INFO"
+CHECKS: dict[str, dict[str, str]] = {
+    "SB01": {"name": "Class Hierarchy Traversal", "severity": "CRITICAL",
+             "desc": "Accessing __mro__, __bases__, __subclasses__() to find importers"},
+    "SB02": {"name": "Builtins Access", "severity": "CRITICAL",
+             "desc": "Direct access to __builtins__ or builtins module"},
+    "SB03": {"name": "Format String Introspection", "severity": "CRITICAL",
+             "desc": "Using format strings to access object attributes and traverse class hierarchy"},
+    "SB04": {"name": "Import Tricks", "severity": "HIGH",
+             "desc": "Using __import__, importlib, __loader__, or __spec__ to load modules"},
+    "SB05": {"name": "Code Object Construction", "severity": "CRITICAL",
+             "desc": "Building code/function objects to bypass restrictions"},
+    "SB06": {"name": "Frame Introspection", "severity": "HIGH",
+             "desc": "Accessing call frames to reach restricted scopes"},
+    "SB07": {"name": "Serialization Escape", "severity": "CRITICAL",
+             "desc": "Using pickle/marshal __reduce__ protocol for code execution"},
+    "SB08": {"name": "FFI Escape", "severity": "CRITICAL",
+             "desc": "Using ctypes/cffi to call C functions and bypass Python restrictions"},
+    "SB09": {"name": "GC Object Discovery", "severity": "HIGH",
+             "desc": "Using garbage collector to find and access restricted objects"},
+    "SB10": {"name": "OS/Process Access", "severity": "HIGH",
+             "desc": "Direct OS command execution or process spawning"},
+    "SB11": {"name": "File System Escape", "severity": "HIGH",
+             "desc": "Accessing files outside sandbox boundaries"},
+    "SB12": {"name": "Signal Abuse", "severity": "MEDIUM",
+             "desc": "Manipulating signal handlers to alter control flow"},
+    "SB13": {"name": "Exception Attribute Exploit", "severity": "CRITICAL",
+             "desc": "Exploiting exception attributes (e.g., AttributeError.obj) to access objects"},
+    "SB14": {"name": "Obfuscated Attribute Access", "severity": "MEDIUM",
+             "desc": "Using getattr/vars/dir for dynamic attribute discovery"},
+    "SB15": {"name": "Metaclass/Decorator Abuse", "severity": "HIGH",
+             "desc": "Using metaclasses or decorators for code execution during class creation"},
+}
 
-    @property
-    def score(self) -> int:
-        return {"CRITICAL": 25, "HIGH": 15, "MEDIUM": 8, "LOW": 3, "INFO": 0}[self.value]
+SEVERITY_WEIGHT = {"CRITICAL": 15, "HIGH": 10, "MEDIUM": 5, "LOW": 2, "INFO": 1}
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
 
-@dataclass
+# ── AST Helpers ─────────────────────────────────────────────────────
+
+
+def _get_name(node: ast.AST) -> str:
+    """Extract a dotted name from an AST node."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _get_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return ""
+
+
+def _collect_imports(tree: ast.Module) -> dict[str, str]:
+    """Collect import aliases → module mappings."""
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                imports[name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for alias in node.names:
+                name = alias.asname or alias.name
+                imports[name] = f"{mod}.{alias.name}" if mod else alias.name
+    return imports
+
+
 class Finding:
-    rule_id: str
-    severity: Severity
-    category: str
-    message: str
-    evidence: str = ""
-    fix: str = ""
+    """A single security finding."""
 
-    def to_dict(self) -> dict:
-        d: dict = {
-            "rule_id": self.rule_id,
-            "severity": self.severity.value,
-            "category": self.category,
+    __slots__ = ("rule", "file", "line", "message", "severity", "fix", "snippet")
+
+    def __init__(self, rule: str, file: str, line: int, message: str,
+                 severity: str, fix: str = "", snippet: str = ""):
+        self.rule = rule
+        self.file = file
+        self.line = line
+        self.message = message
+        self.severity = severity
+        self.fix = fix
+        self.snippet = snippet
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "rule": self.rule,
+            "name": CHECKS[self.rule]["name"],
+            "severity": self.severity,
+            "file": self.file,
+            "line": self.line,
             "message": self.message,
         }
-        if self.evidence:
-            d["evidence"] = self.evidence
         if self.fix:
             d["fix"] = self.fix
+        if self.snippet:
+            d["snippet"] = self.snippet
         return d
 
 
-@dataclass
-class ScanResult:
-    findings: List[Finding] = field(default_factory=list)
-    checks_run: int = 0
-    platform_info: str = ""
-
-    @property
-    def risk_score(self) -> int:
-        return min(sum(f.severity.score for f in self.findings), 100)
-
-    @property
-    def grade(self) -> str:
-        s = self.risk_score
-        if s == 0: return "A+"
-        elif s <= 10: return "A"
-        elif s <= 20: return "B"
-        elif s <= 35: return "C"
-        elif s <= 50: return "D"
-        else: return "F"
-
-    @property
-    def risk_label(self) -> str:
-        s = self.risk_score
-        if s == 0: return "SAFE"
-        elif s <= 20: return "LOW"
-        elif s <= 50: return "MODERATE"
-        elif s <= 75: return "HIGH"
-        else: return "CRITICAL"
+# ── Analyzer ────────────────────────────────────────────────────────
 
 
-def _run_cmd(cmd: List[str], timeout: int = 5) -> Tuple[int, str]:
-    """Run a command and return (returncode, stdout)."""
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-        return -1, ""
+class SandboxAuditor:
+    """Detects Python sandbox escape patterns."""
 
+    def __init__(self) -> None:
+        self.findings: list[Finding] = []
 
-def _truncate(text: str, maxlen: int = 120) -> str:
-    text = text.strip()
-    return text[:maxlen - 3] + "..." if len(text) > maxlen else text
+    def check_file(self, filepath: str, source: str) -> None:
+        """Run all checks on source code."""
+        # Text-based checks (for patterns in strings, comments, etc.)
+        self._check_format_string_text(filepath, source)
+        self._check_filesystem_escape_text(filepath, source)
 
+        # AST-based checks
+        try:
+            tree = ast.parse(source, filename=filepath)
+        except SyntaxError:
+            return
 
-# ── Checks ──────────────────────────────────────────────────────────
+        imports = _collect_imports(tree)
 
-def check_user_privileges(result: ScanResult) -> None:
-    """SA001: Check if running as root or with elevated privileges."""
-    result.checks_run += 1
+        self._check_class_hierarchy(filepath, tree)
+        self._check_builtins_access(filepath, tree)
+        self._check_format_string_ast(filepath, tree)
+        self._check_import_tricks(filepath, tree, imports)
+        self._check_code_object(filepath, tree, imports)
+        self._check_frame_introspection(filepath, tree, imports)
+        self._check_serialization_escape(filepath, tree)
+        self._check_ffi_escape(filepath, tree, imports)
+        self._check_gc_discovery(filepath, tree, imports)
+        self._check_os_access(filepath, tree, imports)
+        self._check_signal_abuse(filepath, tree, imports)
+        self._check_exception_exploit(filepath, tree)
+        self._check_obfuscated_access(filepath, tree)
+        self._check_metaclass_abuse(filepath, tree)
 
-    uid = os.getuid() if hasattr(os, "getuid") else -1
-    euid = os.geteuid() if hasattr(os, "geteuid") else -1
-    username = os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+    # ── SB01: Class Hierarchy Traversal ──────────────────────────
 
-    if uid == 0 or euid == 0:
-        result.findings.append(Finding(
-            rule_id="SA001",
-            severity=Severity.CRITICAL,
-            category="Identity",
-            message="Running as root — agent has full system access",
-            evidence=f"uid={uid} euid={euid} user={username}",
-            fix="Run the agent as a non-root user with minimal privileges",
-        ))
-    else:
-        # Check for sudo capability
-        rc, _ = _run_cmd(["sudo", "-n", "true"])
-        if rc == 0:
-            result.findings.append(Finding(
-                rule_id="SA001",
-                severity=Severity.HIGH,
-                category="Identity",
-                message="Passwordless sudo available — agent can escalate to root",
-                evidence=f"uid={uid} user={username}, sudo -n succeeds",
-                fix="Remove agent user from sudoers or require password",
-            ))
+    def _check_class_hierarchy(self, fp: str, tree: ast.Module) -> None:
+        """Detect __mro__, __bases__, __subclasses__() access."""
+        dangerous_attrs = {
+            "__mro__": "Class method resolution order traversal",
+            "__bases__": "Base class access for hierarchy walking",
+            "__subclasses__": "Subclass enumeration to find importers/loaders",
+            "__init_subclass__": "Subclass hook that executes on class creation",
+        }
 
-
-def check_credentials(result: ScanResult) -> None:
-    """SA002: Check for exposed credentials in environment."""
-    result.checks_run += 1
-
-    # Patterns for sensitive environment variables
-    secret_patterns = [
-        (re.compile(r'(AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)', re.I), "AWS credentials"),
-        (re.compile(r'(AZURE_CLIENT_SECRET|AZURE_TENANT_ID)', re.I), "Azure credentials"),
-        (re.compile(r'(GCP_SERVICE_ACCOUNT|GOOGLE_APPLICATION_CREDENTIALS)', re.I), "GCP credentials"),
-        (re.compile(r'(GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT)', re.I), "GitHub token"),
-        (re.compile(r'(OPENAI_API_KEY|ANTHROPIC_API_KEY)', re.I), "AI provider API key"),
-        (re.compile(r'(DATABASE_URL|DB_PASSWORD|MONGO_URI|REDIS_URL)', re.I), "Database credential"),
-        (re.compile(r'(SLACK_TOKEN|SLACK_BOT_TOKEN|SLACK_WEBHOOK)', re.I), "Slack token"),
-        (re.compile(r'(STRIPE_SECRET_KEY|STRIPE_API_KEY)', re.I), "Payment credential"),
-        (re.compile(r'(NPM_TOKEN|PYPI_TOKEN|RUBYGEMS_API_KEY)', re.I), "Package registry token"),
-        (re.compile(r'(SSH_AUTH_SOCK)', re.I), "SSH agent socket"),
-        (re.compile(r'(DOCKER_HOST|DOCKER_TLS_VERIFY)', re.I), "Docker daemon access"),
-        (re.compile(r'(KUBECONFIG)', re.I), "Kubernetes config"),
-        (re.compile(r'(VAULT_TOKEN|VAULT_ADDR)', re.I), "HashiCorp Vault"),
-        (re.compile(r'(SENDGRID_API_KEY|MAILGUN_API_KEY)', re.I), "Email service key"),
-        (re.compile(r'(TWILIO_AUTH_TOKEN)', re.I), "Twilio credential"),
-    ]
-
-    exposed: List[Tuple[str, str]] = []
-    for key in os.environ:
-        for pattern, desc in secret_patterns:
-            if pattern.match(key):
-                val = os.environ[key]
-                if val and val not in ("", "none", "null", "undefined"):
-                    exposed.append((key, desc))
-                break
-
-    for key, desc in exposed:
-        result.findings.append(Finding(
-            rule_id="SA002",
-            severity=Severity.CRITICAL,
-            category="Credentials",
-            message=f"Exposed credential: {desc}",
-            evidence=f"{key}=****",
-            fix=f"Remove {key} from agent environment or use scoped, short-lived tokens",
-        ))
-
-    # Also check for credential files
-    cred_paths = [
-        ("~/.aws/credentials", "AWS credentials file"),
-        ("~/.aws/config", "AWS config"),
-        ("~/.azure/accessTokens.json", "Azure tokens"),
-        ("~/.config/gcloud/application_default_credentials.json", "GCP credentials"),
-        ("~/.kube/config", "Kubernetes config"),
-        ("~/.docker/config.json", "Docker config (may contain registry tokens)"),
-        ("~/.npmrc", "npm config (may contain auth token)"),
-        ("~/.pypirc", "PyPI config (may contain auth token)"),
-        ("~/.git-credentials", "Git stored credentials"),
-        ("~/.netrc", "netrc (may contain passwords)"),
-        ("~/.vault-token", "Vault token file"),
-    ]
-
-    for path_str, desc in cred_paths:
-        path = Path(os.path.expanduser(path_str))
-        if path.exists():
-            try:
-                readable = os.access(str(path), os.R_OK)
-                if readable:
-                    result.findings.append(Finding(
-                        rule_id="SA002",
-                        severity=Severity.HIGH,
-                        category="Credentials",
-                        message=f"Credential file accessible: {desc}",
-                        evidence=f"{path_str} (readable)",
-                        fix=f"Mount agent environment without access to {path_str}",
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                if node.attr in dangerous_attrs:
+                    self.findings.append(Finding(
+                        "SB01", fp, node.lineno,
+                        f"{dangerous_attrs[node.attr]}: .{node.attr}",
+                        "CRITICAL",
+                        "This pattern is used to traverse class hierarchy and find BuiltinImporter",
                     ))
-            except (OSError, PermissionError):
-                pass
 
-
-def check_ssh_keys(result: ScanResult) -> None:
-    """SA003: Check for accessible SSH keys."""
-    result.checks_run += 1
-
-    ssh_dir = Path.home() / ".ssh"
-    if not ssh_dir.is_dir():
-        return
-
-    key_files = []
-    try:
-        for item in ssh_dir.iterdir():
-            if item.is_file() and not item.name.endswith(".pub") and not item.name == "known_hosts":
-                try:
-                    with open(item, "rb") as f:
-                        header = f.read(40)
-                    if b"PRIVATE KEY" in header or item.name.startswith("id_"):
-                        key_files.append(item.name)
-                except (OSError, PermissionError):
-                    pass
-    except (OSError, PermissionError):
-        return
-
-    if key_files:
-        result.findings.append(Finding(
-            rule_id="SA003",
-            severity=Severity.CRITICAL,
-            category="Credentials",
-            message=f"SSH private keys accessible: {', '.join(key_files)}",
-            evidence=f"~/.ssh/ contains {len(key_files)} private key(s)",
-            fix="Run agent without access to ~/.ssh or use a dedicated deploy key",
-        ))
-
-    # Check SSH agent
-    if os.environ.get("SSH_AUTH_SOCK"):
-        result.findings.append(Finding(
-            rule_id="SA003",
-            severity=Severity.HIGH,
-            category="Credentials",
-            message="SSH agent socket available — agent can use your SSH keys",
-            evidence=f"SSH_AUTH_SOCK={os.environ['SSH_AUTH_SOCK']}",
-            fix="Unset SSH_AUTH_SOCK in agent environment",
-        ))
-
-
-def check_docker_socket(result: ScanResult) -> None:
-    """SA004: Check for Docker socket access."""
-    result.checks_run += 1
-
-    docker_sock = Path("/var/run/docker.sock")
-    if docker_sock.exists():
-        try:
-            readable = os.access(str(docker_sock), os.R_OK)
-            writable = os.access(str(docker_sock), os.W_OK)
-            if readable or writable:
-                result.findings.append(Finding(
-                    rule_id="SA004",
-                    severity=Severity.CRITICAL,
-                    category="Isolation",
-                    message="Docker socket accessible — agent can control all containers and host",
-                    evidence=f"/var/run/docker.sock (r={'Y' if readable else 'N'} w={'Y' if writable else 'N'})",
-                    fix="Run agent without Docker socket access",
-                ))
-        except (OSError, PermissionError):
-            pass
-
-
-def check_filesystem_boundaries(result: ScanResult) -> None:
-    """SA005: Check filesystem access boundaries."""
-    result.checks_run += 1
-
-    sensitive_paths = [
-        ("/etc/shadow", "password hashes"),
-        ("/etc/sudoers", "sudo config"),
-        ("/root", "root home directory"),
-        ("/proc/1/environ", "host process environment"),
-    ]
-
-    for path_str, desc in sensitive_paths:
-        path = Path(path_str)
-        try:
-            if path.exists() and os.access(str(path), os.R_OK):
-                result.findings.append(Finding(
-                    rule_id="SA005",
-                    severity=Severity.HIGH,
-                    category="Isolation",
-                    message=f"Sensitive path readable: {desc}",
-                    evidence=path_str,
-                    fix=f"Use a chroot, container, or namespace to restrict access",
-                ))
-        except (OSError, PermissionError):
-            pass
-
-    # Check if we can write outside CWD
-    for test_dir in ["/tmp", os.path.expanduser("~"), "/var/tmp"]:
-        test_file = os.path.join(test_dir, ".sandboxaudit-probe")
-        try:
-            with open(test_file, "w") as f:
-                f.write("probe")
-            os.unlink(test_file)
-            if test_dir not in (str(Path.cwd()), os.path.expanduser("~")):
-                result.findings.append(Finding(
-                    rule_id="SA005",
-                    severity=Severity.MEDIUM,
-                    category="Isolation",
-                    message=f"Can write outside project directory: {test_dir}",
-                    evidence=f"Write test succeeded in {test_dir}",
-                    fix="Use read-only filesystem with tmpfs for required writable paths",
-                ))
-        except (OSError, PermissionError):
-            pass
-
-
-def check_network_access(result: ScanResult) -> None:
-    """SA006: Check network egress capability."""
-    result.checks_run += 1
-
-    # Try to resolve external hosts
-    test_hosts = [
-        ("api.github.com", 443, "GitHub API"),
-        ("pypi.org", 443, "PyPI"),
-        ("registry.npmjs.org", 443, "npm registry"),
-    ]
-
-    can_resolve = False
-    can_connect = False
-
-    for host, port, desc in test_hosts:
-        try:
-            socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-            can_resolve = True
-
-            # Try actual connection (with timeout)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
-            try:
-                sock.connect((host, port))
-                can_connect = True
-                sock.close()
-                break
-            except (socket.timeout, ConnectionRefusedError, OSError):
-                sock.close()
-        except (socket.gaierror, OSError):
-            pass
-
-    if can_connect:
-        result.findings.append(Finding(
-            rule_id="SA006",
-            severity=Severity.MEDIUM,
-            category="Network",
-            message="Unrestricted network egress — agent can reach external services",
-            evidence="Connected to external host",
-            fix="Use network namespace or firewall rules to restrict egress to required hosts only",
-        ))
-    elif can_resolve:
-        result.findings.append(Finding(
-            rule_id="SA006",
-            severity=Severity.LOW,
-            category="Network",
-            message="DNS resolution works but TCP connections blocked",
-            evidence="DNS resolves but cannot connect",
-        ))
-
-    # Check for unrestricted localhost access
-    for port in [5432, 3306, 6379, 27017, 9200, 2379]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        try:
-            result_code = sock.connect_ex(("127.0.0.1", port))
-            if result_code == 0:
-                svc_names = {5432: "PostgreSQL", 3306: "MySQL", 6379: "Redis",
-                            27017: "MongoDB", 9200: "Elasticsearch", 2379: "etcd"}
-                svc = svc_names.get(port, f"port {port}")
-                result.findings.append(Finding(
-                    rule_id="SA006",
-                    severity=Severity.HIGH,
-                    category="Network",
-                    message=f"Local service accessible: {svc} on port {port}",
-                    evidence=f"127.0.0.1:{port} is open",
-                    fix=f"Isolate agent network namespace from local services",
-                ))
-        except (socket.timeout, OSError):
-            pass
-        finally:
-            sock.close()
-
-
-def check_resource_limits(result: ScanResult) -> None:
-    """SA007: Check for resource limits (ulimit, cgroup)."""
-    result.checks_run += 1
-
-    has_limits = False
-
-    # Check ulimits
-    if hasattr(os, "sysconf"):
-        try:
-            import resource
-            # Check max memory
-            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-            if soft != resource.RLIM_INFINITY:
-                has_limits = True
-            # Check max CPU time
-            soft_cpu, hard_cpu = resource.getrlimit(resource.RLIMIT_CPU)
-            if soft_cpu != resource.RLIM_INFINITY:
-                has_limits = True
-            # Check max processes
-            if hasattr(resource, "RLIMIT_NPROC"):
-                soft_proc, _ = resource.getrlimit(resource.RLIMIT_NPROC)
-                if soft_proc != resource.RLIM_INFINITY:
-                    has_limits = True
-        except (ImportError, ValueError):
-            pass
-
-    # Check cgroup (Linux)
-    cgroup_memory = Path("/sys/fs/cgroup/memory.max")
-    cgroup_memory_v1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    if cgroup_memory.exists():
-        try:
-            val = cgroup_memory.read_text().strip()
-            if val != "max":
-                has_limits = True
-        except (OSError, PermissionError):
-            pass
-    elif cgroup_memory_v1.exists():
-        try:
-            val = int(cgroup_memory_v1.read_text().strip())
-            if val < 2**62:
-                has_limits = True
-        except (OSError, PermissionError, ValueError):
-            pass
-
-    if not has_limits:
-        result.findings.append(Finding(
-            rule_id="SA007",
-            severity=Severity.MEDIUM,
-            category="Resources",
-            message="No resource limits detected — agent could exhaust host resources",
-            fix="Set ulimits, cgroup constraints, or container resource limits",
-        ))
-
-
-def check_container_detection(result: ScanResult) -> None:
-    """SA008: Detect if running inside a container/sandbox."""
-    result.checks_run += 1
-
-    in_container = False
-    container_type = "none detected"
-
-    # Check /.dockerenv
-    if Path("/.dockerenv").exists():
-        in_container = True
-        container_type = "Docker"
-
-    # Check /run/.containerenv (Podman)
-    if Path("/run/.containerenv").exists():
-        in_container = True
-        container_type = "Podman"
-
-    # Check cgroup for container indicators
-    try:
-        cgroup = Path("/proc/1/cgroup").read_text()
-        if "docker" in cgroup or "containerd" in cgroup:
-            in_container = True
-            container_type = "Docker (cgroup)"
-        elif "lxc" in cgroup:
-            in_container = True
-            container_type = "LXC"
-    except (OSError, PermissionError):
-        pass
-
-    # Check for Kubernetes
-    if os.environ.get("KUBERNETES_SERVICE_HOST"):
-        in_container = True
-        container_type = "Kubernetes pod"
-
-    if not in_container:
-        result.findings.append(Finding(
-            rule_id="SA008",
-            severity=Severity.HIGH,
-            category="Isolation",
-            message="Not running in a container — agent executes directly on host",
-            evidence=f"Container detection: {container_type}",
-            fix="Run agent inside a Docker container, VM, or namespace sandbox",
-        ))
-    else:
-        result.findings.append(Finding(
-            rule_id="SA008",
-            severity=Severity.INFO,
-            category="Isolation",
-            message=f"Running in container: {container_type}",
-            evidence=container_type,
-        ))
-
-
-def check_git_config(result: ScanResult) -> None:
-    """SA009: Check git configuration for credential exposure."""
-    result.checks_run += 1
-
-    # Check git credential helper
-    rc, helper = _run_cmd(["git", "config", "--global", "credential.helper"])
-    if rc == 0 and helper:
-        if helper in ("store", "cache"):
-            result.findings.append(Finding(
-                rule_id="SA009",
-                severity=Severity.HIGH,
-                category="Credentials",
-                message=f"Git credential helper '{helper}' — cached credentials accessible",
-                evidence=f"credential.helper={helper}",
-                fix="Use a scoped token for git operations, not cached credentials",
-            ))
-
-    # Check for global git user (indicates shared identity)
-    rc, email = _run_cmd(["git", "config", "--global", "user.email"])
-    if rc == 0 and email:
-        result.findings.append(Finding(
-            rule_id="SA009",
-            severity=Severity.LOW,
-            category="Identity",
-            message=f"Agent uses global git identity: {email}",
-            evidence=f"user.email={email}",
-            fix="Set a dedicated git identity for the agent in the project config",
-        ))
-
-
-def check_shell_history(result: ScanResult) -> None:
-    """SA010: Check if shell history is accessible (may contain secrets)."""
-    result.checks_run += 1
-
-    history_files = [
-        "~/.bash_history",
-        "~/.zsh_history",
-        "~/.python_history",
-        "~/.node_repl_history",
-    ]
-
-    for hist_str in history_files:
-        hist = Path(os.path.expanduser(hist_str))
-        if hist.exists():
-            try:
-                if os.access(str(hist), os.R_OK):
-                    size = hist.stat().st_size
-                    if size > 0:
-                        result.findings.append(Finding(
-                            rule_id="SA010",
-                            severity=Severity.LOW,
-                            category="Credentials",
-                            message=f"Shell history accessible: {hist_str} ({size} bytes)",
-                            evidence=hist_str,
-                            fix="Clear or mount-mask shell history files in agent environment",
+            # __class__ access is suspicious in sandbox context
+            if isinstance(node, ast.Attribute) and node.attr == "__class__":
+                # Check if it's chained: obj.__class__.__mro__ etc.
+                parent = None
+                for n in ast.walk(tree):
+                    for child in ast.iter_child_nodes(n):
+                        if child is node:
+                            parent = n
+                            break
+                if parent and isinstance(parent, ast.Attribute):
+                    if parent.attr in ("__mro__", "__bases__", "__subclasses__",
+                                        "__dict__", "__init__"):
+                        self.findings.append(Finding(
+                            "SB01", fp, node.lineno,
+                            f"Class hierarchy chain: .__class__.{parent.attr}",
+                            "CRITICAL",
+                            "Classic sandbox escape: obj.__class__.__mro__[1].__subclasses__()",
                         ))
-            except (OSError, PermissionError):
+
+    # ── SB02: Builtins Access ────────────────────────────────────
+
+    def _check_builtins_access(self, fp: str, tree: ast.Module) -> None:
+        """Detect access to __builtins__."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                if node.attr == "__builtins__":
+                    self.findings.append(Finding(
+                        "SB02", fp, node.lineno,
+                        "Direct __builtins__ access — can reach __import__ and other restricted builtins",
+                        "CRITICAL",
+                        "Block __builtins__ access in sandbox",
+                    ))
+
+            if isinstance(node, ast.Name) and node.id == "__builtins__":
+                self.findings.append(Finding(
+                    "SB02", fp, node.lineno,
+                    "__builtins__ name reference — attempting to access builtin functions",
+                    "CRITICAL",
+                ))
+
+            # import builtins
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "builtins":
+                        self.findings.append(Finding(
+                            "SB02", fp, node.lineno,
+                            "Importing builtins module directly",
+                            "CRITICAL",
+                            "Block builtins module import in sandbox",
+                        ))
+
+            if isinstance(node, ast.ImportFrom) and node.module == "builtins":
+                self.findings.append(Finding(
+                    "SB02", fp, node.lineno,
+                    "Importing from builtins module",
+                    "CRITICAL",
+                ))
+
+    # ── SB03: Format String Introspection ────────────────────────
+
+    def _check_format_string_ast(self, fp: str, tree: ast.Module) -> None:
+        """Detect format strings with dunder attribute access."""
+        for node in ast.walk(tree):
+            # f-strings with __class__, __dict__, etc.
+            if isinstance(node, ast.JoinedStr):
+                for val in node.values:
+                    if isinstance(val, ast.FormattedValue):
+                        name = _get_name(val.value)
+                        if any(d in name for d in ("__class__", "__dict__",
+                                                     "__mro__", "__bases__",
+                                                     "__subclasses__",
+                                                     "__builtins__",
+                                                     "__globals__",
+                                                     "__init__")):
+                            self.findings.append(Finding(
+                                "SB03", fp, node.lineno,
+                                f"F-string accessing dunder attributes: {name}",
+                                "CRITICAL",
+                                "Format string introspection (n8n CVE-2026-0863, asteval GHSA-3wwr)",
+                            ))
+
+            # "...".format() with dunder access in format spec
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+                    # Check the format string for {0.__class__} patterns
+                    if isinstance(node.func.value, ast.Constant):
+                        fmt_str = str(node.func.value.value)
+                        if re.search(r'\{[^}]*__\w+__[^}]*\}', fmt_str):
+                            self.findings.append(Finding(
+                                "SB03", fp, node.lineno,
+                                "str.format() with dunder attribute access in format spec",
+                                "CRITICAL",
+                                "Classic sandbox escape via format string introspection",
+                            ))
+
+    def _check_format_string_text(self, fp: str, source: str) -> None:
+        """Text-based check for format string escape patterns."""
+        # Check for format specs with dunder access that might be in strings
+        pattern = re.compile(
+            r'''['"].*\{[^}]*(?:__class__|__mro__|__bases__|__subclasses__|'''
+            r'''__builtins__|__globals__|__init__|__dict__|__getattribute__)'''
+            r'''[^}]*\}.*['"]'''
+        )
+        for line_num, line in enumerate(source.splitlines(), 1):
+            if pattern.search(line):
+                # Don't double-count AST findings
+                if ".format" not in line and "f'" not in line and 'f"' not in line:
+                    self.findings.append(Finding(
+                        "SB03", fp, line_num,
+                        "String containing format spec with dunder attribute traversal",
+                        "CRITICAL",
+                        "This string may be used with .format() or eval() for sandbox escape",
+                    ))
+
+    # ── SB04: Import Tricks ──────────────────────────────────────
+
+    def _check_import_tricks(self, fp: str, tree: ast.Module,
+                              imports: dict) -> None:
+        """Detect alternative import mechanisms."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+
+                # __import__()
+                if name == "__import__":
+                    self.findings.append(Finding(
+                        "SB04", fp, node.lineno,
+                        "__import__() call — bypasses standard import restrictions",
+                        "HIGH",
+                        "Block __import__ in sandbox builtins",
+                    ))
+
+                # importlib.import_module()
+                if name in ("importlib.import_module", "import_module"):
+                    self.findings.append(Finding(
+                        "SB04", fp, node.lineno,
+                        "importlib.import_module() — dynamic module loading",
+                        "HIGH",
+                        "Block importlib access in sandbox",
+                    ))
+
+            # Access to __loader__, __spec__
+            if isinstance(node, ast.Attribute):
+                if node.attr in ("__loader__", "__spec__"):
+                    self.findings.append(Finding(
+                        "SB04", fp, node.lineno,
+                        f".{node.attr} access — can reach module loaders",
+                        "HIGH",
+                        "Module loader access can be used to import restricted modules",
+                    ))
+
+                # load_module
+                if node.attr == "load_module":
+                    self.findings.append(Finding(
+                        "SB04", fp, node.lineno,
+                        ".load_module() — direct module loading bypassing import hooks",
+                        "HIGH",
+                    ))
+
+            # import importlib
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "importlib":
+                        self.findings.append(Finding(
+                            "SB04", fp, node.lineno,
+                            "Importing importlib — enables dynamic module loading",
+                            "HIGH",
+                        ))
+
+    # ── SB05: Code Object Construction ───────────────────────────
+
+    def _check_code_object(self, fp: str, tree: ast.Module,
+                            imports: dict) -> None:
+        """Detect code/function object construction."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+
+                # types.CodeType / types.FunctionType
+                if name in ("types.CodeType", "CodeType",
+                             "types.FunctionType", "FunctionType"):
+                    self.findings.append(Finding(
+                        "SB05", fp, node.lineno,
+                        f"{name}() — constructing executable objects from raw bytecode",
+                        "CRITICAL",
+                        "Code object construction bypasses all source-level restrictions",
+                    ))
+
+                # compile() + exec()
+                if name == "compile":
+                    self.findings.append(Finding(
+                        "SB05", fp, node.lineno,
+                        "compile() — creating code objects from strings",
+                        "CRITICAL",
+                        "compile() + exec() bypasses AST-based restrictions",
+                    ))
+
+            # Access to __code__
+            if isinstance(node, ast.Attribute):
+                if node.attr == "__code__":
+                    self.findings.append(Finding(
+                        "SB05", fp, node.lineno,
+                        ".__code__ access — can modify function bytecode",
+                        "CRITICAL",
+                        "Code object manipulation can bypass all restrictions",
+                    ))
+
+                if node.attr == "co_consts":
+                    self.findings.append(Finding(
+                        "SB05", fp, node.lineno,
+                        ".co_consts access — inspecting code object constants",
+                        "HIGH",
+                    ))
+
+            # import types
+            if isinstance(node, ast.ImportFrom) and node.module == "types":
+                for alias in node.names:
+                    if alias.name in ("CodeType", "FunctionType"):
+                        self.findings.append(Finding(
+                            "SB05", fp, node.lineno,
+                            f"Importing {alias.name} from types module",
+                            "CRITICAL",
+                        ))
+
+    # ── SB06: Frame Introspection ────────────────────────────────
+
+    def _check_frame_introspection(self, fp: str, tree: ast.Module,
+                                    imports: dict) -> None:
+        """Detect stack frame access."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+
+                if name in ("sys._getframe", "_getframe"):
+                    self.findings.append(Finding(
+                        "SB06", fp, node.lineno,
+                        "sys._getframe() — accessing call stack frames",
+                        "HIGH",
+                        "Frame access can reach variables in restricted scopes",
+                    ))
+
+                if name in ("inspect.currentframe", "currentframe",
+                             "inspect.stack", "inspect.getouterframes"):
+                    self.findings.append(Finding(
+                        "SB06", fp, node.lineno,
+                        f"{name}() — inspecting call stack",
+                        "HIGH",
+                    ))
+
+            if isinstance(node, ast.Attribute):
+                if node.attr in ("f_globals", "f_locals", "f_builtins",
+                                  "f_back", "f_code"):
+                    self.findings.append(Finding(
+                        "SB06", fp, node.lineno,
+                        f".{node.attr} — accessing frame attributes",
+                        "HIGH",
+                        "Frame attributes expose the global/local scope of callers",
+                    ))
+
+                if node.attr == "__globals__":
+                    self.findings.append(Finding(
+                        "SB06", fp, node.lineno,
+                        ".__globals__ — accessing function's global scope",
+                        "HIGH",
+                        "func.__globals__ exposes the module namespace",
+                    ))
+
+    # ── SB07: Serialization Escape ───────────────────────────────
+
+    def _check_serialization_escape(self, fp: str, tree: ast.Module) -> None:
+        """Detect __reduce__ and serialization-based escapes."""
+        reduce_methods = {"__reduce__", "__reduce_ex__",
+                           "__getstate__", "__setstate__"}
+
+        for node in ast.walk(tree):
+            # Class defining __reduce__
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in reduce_methods:
+                    self.findings.append(Finding(
+                        "SB07", fp, node.lineno,
+                        f"Defining {node.name}() — pickle deserialization hook for code execution",
+                        "CRITICAL",
+                        f"{node.name} is called during unpickling and can execute arbitrary code",
+                    ))
+
+            # copyreg.dispatch_table or copyreg.__newobj__
+            if isinstance(node, ast.Attribute):
+                if node.attr in ("dispatch_table", "__newobj__",
+                                  "__newobj_ex__"):
+                    name = _get_name(node.value)
+                    if "copyreg" in name or "copy_reg" in name:
+                        self.findings.append(Finding(
+                            "SB07", fp, node.lineno,
+                            f"copyreg.{node.attr} — manipulating pickle dispatch",
+                            "CRITICAL",
+                        ))
+
+    # ── SB08: FFI Escape ─────────────────────────────────────────
+
+    def _check_ffi_escape(self, fp: str, tree: ast.Module,
+                           imports: dict) -> None:
+        """Detect ctypes/cffi usage."""
+        ffi_modules = {"ctypes", "cffi", "_ctypes"}
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] in ffi_modules:
+                        self.findings.append(Finding(
+                            "SB08", fp, node.lineno,
+                            f"Importing {alias.name} — foreign function interface",
+                            "CRITICAL",
+                            "FFI bypasses all Python-level restrictions",
+                        ))
+
+            if isinstance(node, ast.ImportFrom):
+                if node.module and node.module.split(".")[0] in ffi_modules:
+                    self.findings.append(Finding(
+                        "SB08", fp, node.lineno,
+                        f"Importing from {node.module} — FFI access",
+                        "CRITICAL",
+                    ))
+
+            # ctypes.CDLL, ctypes.pythonapi etc.
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+                if any(name.startswith(f"{m}.") for m in ffi_modules):
+                    self.findings.append(Finding(
+                        "SB08", fp, node.lineno,
+                        f"{name}() — FFI call",
+                        "CRITICAL",
+                        "Direct C library access bypasses sandbox",
+                    ))
+
+    # ── SB09: GC Object Discovery ────────────────────────────────
+
+    def _check_gc_discovery(self, fp: str, tree: ast.Module,
+                             imports: dict) -> None:
+        """Detect garbage collector abuse."""
+        gc_funcs = {"gc.get_objects", "gc.get_referrers", "gc.get_referents",
+                     "get_objects", "get_referrers", "get_referents"}
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+                if name in gc_funcs:
+                    self.findings.append(Finding(
+                        "SB09", fp, node.lineno,
+                        f"{name}() — enumerating Python objects via garbage collector",
+                        "HIGH",
+                        "GC traversal can find restricted objects in memory",
+                    ))
+
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "gc":
+                        self.findings.append(Finding(
+                            "SB09", fp, node.lineno,
+                            "Importing gc module — enables object discovery",
+                            "HIGH",
+                        ))
+
+    # ── SB10: OS/Process Access ──────────────────────────────────
+
+    def _check_os_access(self, fp: str, tree: ast.Module,
+                          imports: dict) -> None:
+        """Detect OS command execution and process spawning."""
+        os_exec_funcs = {
+            "os.system", "os.popen", "os.exec", "os.execl", "os.execle",
+            "os.execlp", "os.execv", "os.execve", "os.execvp", "os.execvpe",
+            "os.spawn", "os.spawnl", "os.spawnle", "os.spawnlp", "os.spawnv",
+            "os.fork", "os.forkpty",
+        }
+        subprocess_funcs = {
+            "subprocess.run", "subprocess.call", "subprocess.check_output",
+            "subprocess.check_call", "subprocess.Popen", "subprocess.getoutput",
+            "subprocess.getstatusoutput",
+        }
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+
+                if name in os_exec_funcs or any(name.startswith(f) for f in os_exec_funcs):
+                    self.findings.append(Finding(
+                        "SB10", fp, node.lineno,
+                        f"{name}() — OS command execution",
+                        "HIGH",
+                        "Block os module exec/spawn/system functions in sandbox",
+                    ))
+
+                if name in subprocess_funcs:
+                    self.findings.append(Finding(
+                        "SB10", fp, node.lineno,
+                        f"{name}() — subprocess execution",
+                        "HIGH",
+                        "Block subprocess module in sandbox",
+                    ))
+
+            # import os / import subprocess
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in ("os", "subprocess", "pty", "commands"):
+                        self.findings.append(Finding(
+                            "SB10", fp, node.lineno,
+                            f"Importing {alias.name} module",
+                            "HIGH",
+                            f"Block {alias.name} module import in sandbox",
+                        ))
+
+    # ── SB11: File System Escape ─────────────────────────────────
+
+    def _check_filesystem_escape_text(self, fp: str, source: str) -> None:
+        """Detect file system escape attempts."""
+        patterns = [
+            (r'/proc/self/', "/proc/self/ access — process information disclosure"),
+            (r'/proc/\d+/', "/proc/PID access — other process inspection"),
+            (r'/dev/shm\b', "/dev/shm access — shared memory"),
+            (r'/dev/tcp\b', "/dev/tcp access — network connection via filesystem"),
+            (r'\.\./', "Path traversal with ../"),
+        ]
+
+        for line_num, line in enumerate(source.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            for pattern, desc in patterns:
+                if re.search(pattern, line):
+                    self.findings.append(Finding(
+                        "SB11", fp, line_num,
+                        desc,
+                        "HIGH",
+                        "Block filesystem access outside sandbox directory",
+                    ))
+                    break
+
+    # ── SB12: Signal Abuse ───────────────────────────────────────
+
+    def _check_signal_abuse(self, fp: str, tree: ast.Module,
+                             imports: dict) -> None:
+        """Detect signal handler manipulation."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+                if name in ("signal.signal", "signal.alarm",
+                             "signal.setitimer"):
+                    self.findings.append(Finding(
+                        "SB12", fp, node.lineno,
+                        f"{name}() — modifying signal handlers",
+                        "MEDIUM",
+                        "Signal manipulation can alter sandbox control flow",
+                    ))
+
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "signal":
+                        self.findings.append(Finding(
+                            "SB12", fp, node.lineno,
+                            "Importing signal module",
+                            "MEDIUM",
+                        ))
+
+    # ── SB13: Exception Attribute Exploit ────────────────────────
+
+    def _check_exception_exploit(self, fp: str, tree: ast.Module) -> None:
+        """Detect exploitation of exception attributes (Python 3.10+)."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler):
+                # Check if handler accesses .obj, .name, or .args on exception
+                if node.name:
+                    exc_var = node.name
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Attribute):
+                            parent_name = _get_name(child.value)
+                            if parent_name == exc_var:
+                                if child.attr == "obj":
+                                    self.findings.append(Finding(
+                                        "SB13", fp, child.lineno,
+                                        f"Accessing .obj on caught exception — "
+                                        f"AttributeError.obj exploit (Python 3.10+, n8n CVE-2026-0863)",
+                                        "CRITICAL",
+                                        "AttributeError.obj returns the object that raised the error, "
+                                        "bypassing attribute access restrictions",
+                                    ))
+                                elif child.attr == "name":
+                                    # Less dangerous but still suspicious in sandbox context
+                                    pass
+
+            # try/except* (Python 3.11+) — RestrictedPython CVE-2025-22153
+            if hasattr(ast, "TryStar") and isinstance(node, ast.TryStar):
+                self.findings.append(Finding(
+                    "SB13", fp, node.lineno,
+                    "try/except* (ExceptionGroup) — potential sandbox escape "
+                    "(RestrictedPython CVE-2025-22153)",
+                    "HIGH",
+                    "except* clauses may bypass sandbox exception handling restrictions",
+                ))
+
+    # ── SB14: Obfuscated Attribute Access ────────────────────────
+
+    def _check_obfuscated_access(self, fp: str, tree: ast.Module) -> None:
+        """Detect dynamic attribute access for discovery/bypass."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = _get_name(node.func)
+
+                # getattr(obj, "__builtins__") / getattr(obj, dunder)
+                if name == "getattr" and len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                        if attr_arg.value.startswith("__") and attr_arg.value.endswith("__"):
+                            self.findings.append(Finding(
+                                "SB14", fp, node.lineno,
+                                f'getattr() accessing dunder: "{attr_arg.value}"',
+                                "MEDIUM",
+                                "getattr with dunder names bypasses static attribute restrictions",
+                            ))
+                    # getattr with variable name (can't check statically)
+                    elif isinstance(attr_arg, ast.Name):
+                        self.findings.append(Finding(
+                            "SB14", fp, node.lineno,
+                            f"getattr() with variable attribute name — dynamic access",
+                            "MEDIUM",
+                            "Variable attribute names may contain restricted dunder attributes",
+                        ))
+
+                # setattr with dunders
+                if name == "setattr" and len(node.args) >= 2:
+                    attr_arg = node.args[1]
+                    if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
+                        if attr_arg.value.startswith("__") and attr_arg.value.endswith("__"):
+                            self.findings.append(Finding(
+                                "SB14", fp, node.lineno,
+                                f'setattr() modifying dunder: "{attr_arg.value}"',
+                                "HIGH",
+                                "Modifying dunder attributes can alter object behavior",
+                            ))
+
+            # __dict__ access for attribute discovery
+            if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+                self.findings.append(Finding(
+                    "SB14", fp, node.lineno,
+                    ".__dict__ access — direct namespace manipulation",
+                    "MEDIUM",
+                    "dict access bypasses __getattribute__ and descriptor protocol",
+                ))
+
+    # ── SB15: Metaclass/Decorator Abuse ──────────────────────────
+
+    def _check_metaclass_abuse(self, fp: str, tree: ast.Module) -> None:
+        """Detect metaclass and decorator-based execution."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                # Check for metaclass keyword
+                for kw in node.keywords:
+                    if kw.arg == "metaclass":
+                        self.findings.append(Finding(
+                            "SB15", fp, node.lineno,
+                            "Custom metaclass — code executes during class creation",
+                            "HIGH",
+                            "Metaclasses can execute arbitrary code when a class is defined "
+                            "(Langflow CVE-2025-3248 pattern)",
+                        ))
+
+                # Check for __init_subclass__ in class body
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        if item.name == "__init_subclass__":
+                            self.findings.append(Finding(
+                                "SB15", fp, item.lineno,
+                                "__init_subclass__() — executes when subclassed",
+                                "HIGH",
+                                "This hook runs automatically when any class inherits from this one",
+                            ))
+                        if item.name == "__set_name__":
+                            self.findings.append(Finding(
+                                "SB15", fp, item.lineno,
+                                "__set_name__() — descriptor hook executes during class creation",
+                                "HIGH",
+                            ))
+
+            # Decorators that call functions (execution during definition)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if isinstance(dec, ast.Call):
+                        name = _get_name(dec.func)
+                        # Flag suspicious decorator calls that could execute code
+                        if any(d in name.lower() for d in
+                               ("exec", "eval", "system", "import")):
+                            self.findings.append(Finding(
+                                "SB15", fp, node.lineno,
+                                f"Suspicious decorator call: @{name}(...)",
+                                "HIGH",
+                                "Decorators execute during function/class definition, "
+                                "before the function body runs",
+                            ))
+
+
+# ── Scanning and Output ─────────────────────────────────────────────
+
+
+def scan_path(path: str, auditor: SandboxAuditor) -> int:
+    """Scan a file or directory. Returns number of files scanned."""
+    p = Path(path)
+    count = 0
+
+    if p.is_file():
+        if p.suffix == ".py":
+            try:
+                source = p.read_text(encoding="utf-8", errors="ignore")
+                auditor.check_file(str(p), source)
+                count = 1
+            except OSError:
                 pass
+    elif p.is_dir():
+        skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv",
+                     ".tox", ".eggs", "build", "dist", ".mypy_cache"}
+        for root, dirs, files in os.walk(p):
+            dirs[:] = [d for d in dirs if d not in skip_dirs
+                       and not d.endswith(".egg-info")]
+            for fname in files:
+                if fname.endswith(".py"):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        source = Path(fpath).read_text(encoding="utf-8", errors="ignore")
+                        auditor.check_file(fpath, source)
+                        count += 1
+                    except OSError:
+                        pass
+    return count
 
 
-def check_process_visibility(result: ScanResult) -> None:
-    """SA011: Check if agent can see other users' processes."""
-    result.checks_run += 1
-
-    if sys.platform == "darwin":
-        rc, output = _run_cmd(["ps", "aux"])
-    else:
-        rc, output = _run_cmd(["ps", "auxww"])
-
-    if rc == 0 and output:
-        lines = output.strip().split("\n")
-        my_user = os.environ.get("USER", os.environ.get("USERNAME", ""))
-        other_users = set()
-        for line in lines[1:]:
-            parts = line.split()
-            if parts and parts[0] != my_user and parts[0] not in ("root", "USER"):
-                other_users.add(parts[0])
-
-        if other_users:
-            result.findings.append(Finding(
-                rule_id="SA011",
-                severity=Severity.MEDIUM,
-                category="Isolation",
-                message=f"Can see processes from other users: {', '.join(sorted(other_users)[:5])}",
-                evidence=f"{len(other_users)} other user(s) visible",
-                fix="Use PID namespace isolation (pid: host should be disabled)",
-            ))
+def compute_score(findings: list[Finding]) -> int:
+    deductions = sum(SEVERITY_WEIGHT[f.severity] for f in findings)
+    return max(0, 100 - deductions)
 
 
-# ── Main Scanner ────────────────────────────────────────────────────
-
-def scan_environment() -> ScanResult:
-    """Run all sandbox security checks."""
-    result = ScanResult()
-    result.platform_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
-
-    checks = [
-        check_user_privileges,
-        check_credentials,
-        check_ssh_keys,
-        check_docker_socket,
-        check_filesystem_boundaries,
-        check_network_access,
-        check_resource_limits,
-        check_container_detection,
-        check_git_config,
-        check_shell_history,
-        check_process_visibility,
-    ]
-
-    for check in checks:
-        try:
-            check(result)
-        except Exception:
-            pass  # Don't let one check failure stop others
-
-    return result
+def grade(score: int) -> str:
+    if score >= 95: return "A+"
+    if score >= 90: return "A"
+    if score >= 80: return "B"
+    if score >= 70: return "C"
+    if score >= 60: return "D"
+    return "F"
 
 
-# ── Output ──────────────────────────────────────────────────────────
+def severity_color(severity: str) -> str:
+    return {"CRITICAL": "\033[91m", "HIGH": "\033[93m", "MEDIUM": "\033[33m",
+            "LOW": "\033[36m", "INFO": "\033[90m"}.get(severity, "")
 
-RED = "\033[91m"
-YELLOW = "\033[93m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-GRAY = "\033[90m"
-BOLD = "\033[1m"
+
 RESET = "\033[0m"
-MAGENTA = "\033[95m"
-
-SEVERITY_COLORS = {
-    Severity.CRITICAL: RED, Severity.HIGH: YELLOW,
-    Severity.MEDIUM: MAGENTA, Severity.LOW: CYAN, Severity.INFO: GRAY,
-}
+BOLD = "\033[1m"
+DIM = "\033[2m"
 
 
-def _supports_color() -> bool:
-    if os.getenv("NO_COLOR"): return False
-    if os.getenv("FORCE_COLOR"): return True
-    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+def print_results(auditor: SandboxAuditor, files_scanned: int,
+                  verbose: bool = False, severity_filter: str | None = None,
+                  ignore_rules: set[str] | None = None) -> tuple[int, str]:
+    findings = auditor.findings
+    if severity_filter:
+        sev_idx = SEVERITY_ORDER.get(severity_filter.upper(), 99)
+        findings = [f for f in findings if SEVERITY_ORDER[f.severity] <= sev_idx]
+    if ignore_rules:
+        findings = [f for f in findings if f.rule not in ignore_rules]
+
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.file, f.line))
+    score = compute_score(findings)
+    g = grade(score)
+
+    print(f"\n{BOLD}🔒 sandboxaudit{RESET} — Sandbox Escape Pattern Detector")
+    print(f"{DIM}{'─' * 60}{RESET}")
+    print(f"  Files scanned: {files_scanned}")
+    print(f"  Findings: {len(findings)}")
+    print(f"  Score: {BOLD}{score}/100{RESET}  Grade: {BOLD}{g}{RESET}")
+    print(f"{DIM}{'─' * 60}{RESET}")
+
+    if not findings:
+        print(f"\n  {BOLD}✅ No sandbox escape patterns detected.{RESET}\n")
+        return score, g
+
+    by_sev: dict[str, int] = {}
+    for f in findings:
+        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+    print()
+    for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if sev in by_sev:
+            print(f"  {severity_color(sev)}{sev}{RESET}: {by_sev[sev]}")
+
+    by_check: dict[str, int] = {}
+    for f in findings:
+        by_check[f.rule] = by_check.get(f.rule, 0) + 1
+    print(f"\n{DIM}{'─' * 60}{RESET}")
+    for rule in sorted(by_check.keys()):
+        check = CHECKS[rule]
+        color = severity_color(check["severity"])
+        print(f"  {color}{rule}{RESET} {check['name']}: {by_check[rule]}")
+
+    print(f"\n{DIM}{'─' * 60}{RESET}")
+    current_file = ""
+    for f in findings:
+        if f.file != current_file:
+            current_file = f.file
+            print(f"\n  {BOLD}{current_file}{RESET}")
+
+        color = severity_color(f.severity)
+        print(f"    {DIM}L{f.line:<4}{RESET} {color}{f.severity:<8}{RESET} "
+              f"{color}{f.rule}{RESET} {f.message}")
+        if verbose and f.fix:
+            print(f"         {DIM}Fix: {f.fix}{RESET}")
+
+    print()
+    return score, g
 
 
-def format_text(result: ScanResult, verbose: bool = False, color: bool = True) -> str:
-    use_color = color and _supports_color()
+def print_json(auditor: SandboxAuditor, files_scanned: int,
+               severity_filter: str | None = None,
+               ignore_rules: set[str] | None = None) -> tuple[int, str]:
+    findings = auditor.findings
+    if severity_filter:
+        sev_idx = SEVERITY_ORDER.get(severity_filter.upper(), 99)
+        findings = [f for f in findings if SEVERITY_ORDER[f.severity] <= sev_idx]
+    if ignore_rules:
+        findings = [f for f in findings if f.rule not in ignore_rules]
 
-    def c(code: str, text: str) -> str:
-        return f"{code}{text}{RESET}" if use_color else text
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.file, f.line))
+    score = compute_score(findings)
+    g = grade(score)
 
-    lines: List[str] = []
-    grade_color = GREEN if result.grade.startswith("A") else (YELLOW if result.grade in ("B", "C") else RED)
-    risk_color = GREEN if result.risk_label == "SAFE" else (YELLOW if result.risk_label in ("LOW", "MODERATE") else RED)
-
-    lines.append(c(BOLD, "sandboxaudit") + " — AI Agent Sandbox Security Audit")
-    lines.append("")
-    lines.append(f"  Grade: {c(grade_color, c(BOLD, result.grade))}  Risk: {c(risk_color, result.risk_label)} ({result.risk_score}/100)")
-    lines.append(f"  Platform: {result.platform_info}")
-    lines.append(f"  Checks run: {result.checks_run}  Findings: {len(result.findings)}")
-    lines.append("")
-
-    if not result.findings:
-        lines.append(c(GREEN, "  ✓ Sandbox appears properly isolated"))
-        return "\n".join(lines)
-
-    # Group by category
-    categories: Dict[str, List[Finding]] = {}
-    for f in result.findings:
-        categories.setdefault(f.category, []).append(f)
-
-    for cat, findings in sorted(categories.items()):
-        cat_findings = [f for f in findings if f.severity != Severity.INFO or verbose]
-        if not cat_findings:
-            continue
-
-        lines.append(c(BOLD, f"  [{cat}]"))
-        for f in cat_findings:
-            sev_color = SEVERITY_COLORS[f.severity]
-            lines.append(f"    {c(sev_color, f'[{f.severity.value}]')} [{f.rule_id}] {f.message}")
-            if f.evidence:
-                lines.append(f"      {c(GRAY, '→ ' + f.evidence)}")
-            if f.fix:
-                lines.append(f"      {c(CYAN, '⚡ ' + f.fix)}")
-            lines.append("")
-
-    return "\n".join(lines)
-
-
-def format_json(result: ScanResult) -> str:
-    data = {
-        "grade": result.grade,
-        "risk": result.risk_label,
-        "score": result.risk_score,
-        "platform": result.platform_info,
-        "checks_run": result.checks_run,
-        "findings": [f.to_dict() for f in result.findings],
+    result = {
+        "tool": "sandboxaudit",
+        "version": __version__,
+        "files_scanned": files_scanned,
+        "score": score,
+        "grade": g,
+        "summary": {sev: sum(1 for f in findings if f.severity == sev)
+                     for sev in SEVERITY_ORDER if any(f.severity == sev for f in findings)},
+        "findings": [f.to_dict() for f in findings],
     }
-    return json.dumps(data, indent=2)
+    print(json.dumps(result, indent=2))
+    return score, g
 
 
-# ── Rule Reference ──────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────
 
-RULES = {
-    "SA001": ("CRITICAL/HIGH", "Identity", "Running as root or passwordless sudo available"),
-    "SA002": ("CRITICAL/HIGH", "Credentials", "Exposed credentials in env vars or credential files"),
-    "SA003": ("CRITICAL/HIGH", "Credentials", "SSH private keys or agent socket accessible"),
-    "SA004": ("CRITICAL", "Isolation", "Docker socket accessible (container escape)"),
-    "SA005": ("HIGH/MEDIUM", "Isolation", "Sensitive filesystem paths readable/writable"),
-    "SA006": ("HIGH/MEDIUM", "Network", "Unrestricted network egress or local service access"),
-    "SA007": ("MEDIUM", "Resources", "No CPU/memory resource limits"),
-    "SA008": ("HIGH/INFO", "Isolation", "Container/sandbox detection"),
-    "SA009": ("HIGH/LOW", "Credentials", "Git credential helper or shared identity"),
-    "SA010": ("LOW", "Credentials", "Shell history accessible (may contain secrets)"),
-    "SA011": ("MEDIUM", "Isolation", "Can see other users' processes"),
-}
-
-
-def format_rules() -> str:
-    lines = ["sandboxaudit rules:", ""]
-    for rule_id, (severity, category, desc) in sorted(RULES.items()):
-        lines.append(f"  {rule_id}  [{severity:>14s}]  [{category:>11s}]  {desc}")
-    return "\n".join(lines)
-
-
-# ── CLI ─────────────────────────────────────────────────────────────
 
 def main() -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(
         prog="sandboxaudit",
-        description="AI Agent Sandbox Security Auditor",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""examples:
-  sandboxaudit                    Audit current environment
-  sandboxaudit --json             JSON output for CI
-  sandboxaudit --ci               Exit 1 if HIGH+, exit 2 if CRITICAL
-  sandboxaudit --rules            List all rules
-
-Run this inside your agent's sandbox to verify isolation before
-granting autonomous execution privileges.
-""",
+        description="🔒 Python Sandbox Escape Pattern Detector — screen code before sandbox execution",
     )
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show INFO findings")
-    parser.add_argument("--rules", action="store_true", help="List all rules and exit")
-    parser.add_argument("--ci", action="store_true",
-                        help="CI mode: exit 1 if HIGH+, exit 2 if CRITICAL")
+    parser.add_argument("paths", nargs="*", default=["."],
+                        help="Files or directories to scan (default: current directory)")
+    parser.add_argument("--check", action="store_true",
+                        help="CI mode: exit 1 if grade below threshold")
+    parser.add_argument("--threshold", default="C",
+                        help="Minimum passing grade for --check (default: C)")
+    parser.add_argument("--json", dest="json_output", action="store_true",
+                        help="Output results as JSON")
+    parser.add_argument("--severity",
+                        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                        help="Minimum severity to report")
+    parser.add_argument("--ignore", action="append", default=[],
+                        help="Rules to ignore (e.g., --ignore SB12)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show fix suggestions and CVE references")
     parser.add_argument("--version", action="version",
                         version=f"sandboxaudit {__version__}")
 
     args = parser.parse_args()
 
-    if args.rules:
-        print(format_rules())
-        return 0
+    auditor = SandboxAuditor()
+    total_files = 0
+    ignore_rules = set(args.ignore)
 
-    result = scan_environment()
+    for path in args.paths:
+        if path == "-":
+            source = sys.stdin.read()
+            auditor.check_file("<stdin>", source)
+            total_files += 1
+        else:
+            total_files += scan_path(path, auditor)
 
-    if args.json:
-        print(format_json(result))
+    if total_files == 0:
+        print("No Python files found.", file=sys.stderr)
+        return 1
+
+    if args.json_output:
+        score, g = print_json(auditor, total_files, args.severity, ignore_rules)
     else:
-        print(format_text(result, verbose=args.verbose))
+        score, g = print_results(auditor, total_files, args.verbose,
+                                  args.severity, ignore_rules)
 
-    if args.ci:
-        has_critical = any(f.severity == Severity.CRITICAL for f in result.findings)
-        has_high = any(f.severity == Severity.HIGH for f in result.findings)
-        if has_critical: return 2
-        if has_high: return 1
+    if args.check:
+        threshold_score = {"A+": 95, "A": 90, "B": 80, "C": 70, "D": 60, "F": 0}
+        min_score = threshold_score.get(args.threshold.upper(), 70)
+        if score < min_score:
+            return 1
+
     return 0
 
 

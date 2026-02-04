@@ -1,169 +1,124 @@
-# sandboxaudit
+# 🔒 sandboxaudit
 
-**AI Agent Sandbox Security Auditor** — Runtime probe that verifies whether an AI coding agent's execution environment is properly isolated before granting autonomous code execution privileges.
+**Python Sandbox Escape Pattern Detector** — screen Python code for sandbox escape techniques before executing it in a restricted environment.
 
-Run this inside your agent's sandbox (Ralph Wiggum loops, Claude Code with `--dangerously-skip-permissions`, Codex, Devin, etc.) to find exposed credentials, excessive permissions, missing container boundaries, and unrestricted network access.
+Detects the patterns used in real-world sandbox escapes: class hierarchy traversal, format string introspection, builtins access, code object construction, FFI escapes, and more. Informed by actual CVEs including n8n CVE-2026-0863, Langflow CVE-2025-3248, and RestrictedPython CVE-2025-22153.
 
-Maps to [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/):
-- **ASI03** — Identity and Privilege Abuse
-- **ASI05** — Unexpected Code Execution
+## What It Detects
 
-## Why
+| Rule | Category | Severity | Technique |
+|------|----------|----------|-----------|
+| SB01 | Class Hierarchy Traversal | CRITICAL | `__mro__`, `__bases__`, `__subclasses__()` to find importers |
+| SB02 | Builtins Access | CRITICAL | `__builtins__`, `import builtins` |
+| SB03 | Format String Introspection | CRITICAL | `f"{obj.__class__.__mro__}"`, `"{0.__class__}".format()` |
+| SB04 | Import Tricks | HIGH | `__import__()`, `importlib`, `__loader__`, `__spec__` |
+| SB05 | Code Object Construction | CRITICAL | `types.CodeType`, `compile()`, `__code__` |
+| SB06 | Frame Introspection | HIGH | `sys._getframe()`, `f_globals`, `__globals__` |
+| SB07 | Serialization Escape | CRITICAL | `__reduce__`, `__reduce_ex__` pickle hooks |
+| SB08 | FFI Escape | CRITICAL | `ctypes`, `cffi` — C-level sandbox bypass |
+| SB09 | GC Object Discovery | HIGH | `gc.get_objects()`, `gc.get_referrers()` |
+| SB10 | OS/Process Access | HIGH | `os.system()`, `subprocess`, `os.exec*` |
+| SB11 | File System Escape | HIGH | `/proc/self/`, `../` path traversal |
+| SB12 | Signal Abuse | MEDIUM | `signal.signal()`, `signal.alarm()` |
+| SB13 | Exception Attribute Exploit | CRITICAL | `AttributeError.obj` (Python 3.10+, n8n CVE-2026-0863) |
+| SB14 | Obfuscated Access | MEDIUM | `getattr(obj, "__builtins__")`, `__dict__` |
+| SB15 | Metaclass/Decorator Abuse | HIGH | Custom metaclasses, `__init_subclass__`, `__set_name__` |
 
-Autonomous coding agents need execution environments. Most teams give them:
-- The developer's full home directory
-- All cloud credentials in the environment
-- SSH keys, git tokens, Docker socket access
-- Unrestricted network egress
-- No resource limits
+## Use Cases
 
-Then wonder why things go wrong. `sandboxaudit` tells you exactly what's exposed.
+- **Workflow automation** — Screen user-submitted Python in n8n, Airflow, Prefect
+- **AI agent sandboxes** — Pre-check LLM-generated code before execution
+- **Code execution services** — Replit, Jupyter Hub, coding challenge platforms
+- **CI/CD pipelines** — Audit plugins, extensions, or user-contributed code
+- **Security research** — Analyze potential exploits and CTF challenges
 
 ## Install
 
 ```bash
-# No dependencies. Just Python 3.8+.
 curl -O https://raw.githubusercontent.com/kriskimmerle/sandboxaudit/main/sandboxaudit.py
 chmod +x sandboxaudit.py
-```
-
-Or clone:
-```bash
-git clone https://github.com/kriskimmerle/sandboxaudit.git
-cd sandboxaudit
-python3 sandboxaudit.py
 ```
 
 ## Usage
 
 ```bash
-# Audit current environment
-python3 sandboxaudit.py
+# Scan submitted code
+python3 sandboxaudit.py submitted_code.py
 
-# JSON output (for CI/CD pipelines)
-python3 sandboxaudit.py --json
+# Scan with fix suggestions and CVE references
+python3 sandboxaudit.py -v suspicious.py
 
-# CI mode: exit 1 if HIGH+, exit 2 if CRITICAL
-python3 sandboxaudit.py --ci
+# CI mode — reject code with escape patterns
+python3 sandboxaudit.py --check --threshold A submitted.py
 
-# Show INFO-level findings
-python3 sandboxaudit.py -v
+# JSON output for integration
+python3 sandboxaudit.py --json code.py
 
-# List all rules
-python3 sandboxaudit.py --rules
+# Scan from stdin (pipe from code submission)
+cat user_code.py | python3 sandboxaudit.py -
+
+# Only show critical patterns
+python3 sandboxaudit.py --severity CRITICAL code.py
 ```
+
+## CVE Coverage
+
+sandboxaudit detects patterns from real sandbox escapes:
+
+| CVE | Product | Technique | Rule |
+|-----|---------|-----------|------|
+| CVE-2026-0863 | n8n | Format string + AttributeError.obj | SB03, SB13 |
+| CVE-2025-68668 | n8n (Pyodide) | eval_code() sandbox bypass | SB05 |
+| CVE-2025-22153 | RestrictedPython | try/except* escape | SB13 |
+| CVE-2025-3248 | Langflow | Decorator evaluation RCE | SB15 |
+| GHSA-3wwr-3g9f-9gc7 | asteval | Format string introspection | SB03 |
 
 ## Example Output
 
 ```
-sandboxaudit — AI Agent Sandbox Security Audit
+🔒 sandboxaudit — Sandbox Escape Pattern Detector
+────────────────────────────────────────────────────────────
+  Files scanned: 1
+  Findings: 56
+  Score: 0/100  Grade: F
+────────────────────────────────────────────────────────────
 
-  Grade: F  Risk: CRITICAL (100/100)
-  Platform: Darwin 25.2.0 (arm64)
-  Checks run: 11  Findings: 11
+  CRITICAL: 22
+  HIGH: 27
+  MEDIUM: 7
 
-  [Credentials]
-    [CRITICAL] [SA002] Exposed credential: SSH agent socket
-      → SSH_AUTH_SOCK=****
-      ⚡ Remove SSH_AUTH_SOCK from agent environment or use scoped, short-lived tokens
-
-    [HIGH] [SA002] Credential file accessible: Git stored credentials
-      → ~/.git-credentials (readable)
-      ⚡ Mount agent environment without access to ~/.git-credentials
-
-    [HIGH] [SA003] SSH agent socket available — agent can use your SSH keys
-      → SSH_AUTH_SOCK=/private/tmp/com.apple.launchd.xxx/Listeners
-      ⚡ Unset SSH_AUTH_SOCK in agent environment
-
-  [Identity]
-    [LOW] [SA009] Agent uses global git identity: dev@example.com
-      → user.email=dev@example.com
-      ⚡ Set a dedicated git identity for the agent in the project config
-
-  [Isolation]
-    [HIGH] [SA008] Not running in a container — agent executes directly on host
-      → Container detection: none detected
-      ⚡ Run agent inside a Docker container, VM, or namespace sandbox
-
-  [Network]
-    [MEDIUM] [SA006] Unrestricted network egress — agent can reach external services
-      → Connected to external host
-      ⚡ Use network namespace or firewall rules to restrict egress to required hosts only
+────────────────────────────────────────────────────────────
+  SB01 Class Hierarchy Traversal: 7
+  SB02 Builtins Access: 2
+  SB03 Format String Introspection: 3
+  SB05 Code Object Construction: 6
+  SB07 Serialization Escape: 2
+  SB08 FFI Escape: 2
+  SB13 Exception Attribute Exploit: 1
+  ...
 ```
 
-## Rules
+## Integration Example
 
-| Rule | Severity | Category | Description |
-|------|----------|----------|-------------|
-| SA001 | CRITICAL/HIGH | Identity | Running as root or passwordless sudo |
-| SA002 | CRITICAL/HIGH | Credentials | Exposed credentials in env vars or files |
-| SA003 | CRITICAL/HIGH | Credentials | SSH private keys or agent socket accessible |
-| SA004 | CRITICAL | Isolation | Docker socket accessible (container escape) |
-| SA005 | HIGH/MEDIUM | Isolation | Sensitive filesystem paths readable/writable |
-| SA006 | HIGH/MEDIUM | Network | Unrestricted network egress or local services |
-| SA007 | MEDIUM | Resources | No CPU/memory resource limits |
-| SA008 | HIGH/INFO | Isolation | Container/sandbox detection |
-| SA009 | HIGH/LOW | Credentials | Git credential helper or shared identity |
-| SA010 | LOW | Credentials | Shell history accessible (may contain secrets) |
-| SA011 | MEDIUM | Isolation | Can see other users' processes |
+Pre-screen code before sandbox execution:
 
-## Grading
+```python
+import subprocess
+import sys
 
-| Grade | Score | Risk Level |
-|-------|-------|------------|
-| A+ | 0 | SAFE |
-| A | 1-10 | LOW |
-| B | 11-20 | LOW |
-| C | 21-35 | MODERATE |
-| D | 36-50 | MODERATE |
-| F | 51+ | HIGH/CRITICAL |
-
-## CI/CD Integration
-
-```yaml
-# GitHub Actions example
-- name: Audit agent sandbox
-  run: |
-    python3 sandboxaudit.py --ci
-    # Fails the build if HIGH or CRITICAL findings
+def is_safe(code: str) -> bool:
+    """Check if code is safe to execute in sandbox."""
+    result = subprocess.run(
+        [sys.executable, "sandboxaudit.py", "--json", "--check", "--threshold", "A", "-"],
+        input=code, capture_output=True, text=True
+    )
+    return result.returncode == 0
 ```
 
-```yaml
-# GitLab CI example
-audit-sandbox:
-  script:
-    - python3 sandboxaudit.py --json > sandbox-report.json
-  artifacts:
-    paths:
-      - sandbox-report.json
-```
+## Requirements
 
-## Use Cases
-
-### Before Enabling Autonomous Agents
-```bash
-# In your Dockerfile for the agent sandbox:
-FROM python:3.12-slim
-COPY sandboxaudit.py /usr/local/bin/
-RUN python3 /usr/local/bin/sandboxaudit.py --ci
-# If this passes, the container is reasonably isolated
-```
-
-### Validating Docker Sandbox
-```bash
-# Test your agent's Docker setup
-docker run --rm your-agent-image python3 sandboxaudit.py --json
-```
-
-### Periodic Monitoring
-```bash
-# Cron job to audit agent environment daily
-0 6 * * * python3 /opt/sandboxaudit.py --json >> /var/log/sandbox-audit.jsonl
-```
-
-## Zero Dependencies
-
-`sandboxaudit` uses only Python standard library. No pip install. No venv. Works on Python 3.8+ across Linux and macOS.
+- Python 3.9+
+- Zero external dependencies
 
 ## License
 
